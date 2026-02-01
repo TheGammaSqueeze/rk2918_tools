@@ -3,10 +3,28 @@
 #include <string.h>
 #include <limits.h>
 #include <time.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <sys/types.h>
 #include "rkrom_29xx.h"
 #include "md5.h"
 
-int export_data(const char *filename, unsigned int offset, unsigned int length, FILE *fp)
+static int64_t get_file_size(FILE *fp)
+{
+	off_t cur = ftello(fp);
+	if (cur < 0)
+		return -1;
+	if (fseeko(fp, 0, SEEK_END) != 0)
+		return -1;
+	off_t end = ftello(fp);
+	if (end < 0)
+		return -1;
+	if (fseeko(fp, cur, SEEK_SET) != 0)
+		return -1;
+	return (int64_t)end;
+}
+
+int export_data(const char *filename, uint64_t offset, uint64_t length, FILE *fp)
 {
 	FILE *out_fp = NULL;
 	unsigned char buffer[1024];
@@ -19,14 +37,27 @@ int export_data(const char *filename, unsigned int offset, unsigned int length, 
 		goto export_end;
 	}
 
-	fseek(fp, offset, SEEK_SET);
-
-	for (;length > 0;)
+	if (fseeko(fp, (off_t)offset, SEEK_SET) != 0)
 	{
-		int readlen = length < sizeof(buffer) ? length : sizeof(buffer);
-		readlen = fread(buffer, 1, readlen, fp);
-		length -= readlen;
-		fwrite(buffer, 1, readlen, out_fp);
+		fprintf(stderr, "seek failed (offset=%" PRIu64 "): %s\n", offset, strerror(errno));
+		goto export_end;
+	}
+
+	for (; length > 0; )
+	{
+		size_t want = (length < (uint64_t)sizeof(buffer)) ? (size_t)length : sizeof(buffer);
+		size_t got = fread(buffer, 1, want, fp);
+		if (got == 0)
+		{
+			fprintf(stderr, "unexpected EOF while exporting (remaining=%" PRIu64 ")\n", length);
+			goto export_end;
+		}
+		if (fwrite(buffer, 1, got, out_fp) != got)
+		{
+			fprintf(stderr, "write failed: %s\n", strerror(errno));
+			goto export_end;
+		}
+		length -= (uint64_t)got;
 	}
 	
 	fclose(out_fp);
@@ -38,22 +69,25 @@ export_end:
 	return -1;
 }
 
-int check_md5sum(FILE *fp, size_t length)
+int check_md5sum(FILE *fp, uint64_t length)
 {
-	char buf[1024];
+	unsigned char buf[1024];
 	unsigned char md5sum[16];
 	MD5_CTX md5_ctx;
 	int i;
 
-	fseek(fp, 0, SEEK_SET);
+	if (fseeko(fp, 0, SEEK_SET) != 0)
+		return -1;
 
 	MD5_Init(&md5_ctx);
 	while (length > 0)
 	{
-		int readlen = length < sizeof(buf) ? length : sizeof(buf);
-		readlen = fread(buf, 1, readlen, fp);
-		length -= readlen;
-		MD5_Update(&md5_ctx, buf, readlen);
+		size_t want = (length < (uint64_t)sizeof(buf)) ? (size_t)length : sizeof(buf);
+		size_t got = fread(buf, 1, want, fp);
+		if (got == 0)
+			return -1;
+		length -= (uint64_t)got;
+		MD5_Update(&md5_ctx, buf, got);
 	}
 
 	MD5_Final(md5sum, &md5_ctx);
@@ -84,7 +118,7 @@ int unpack_rom(const char* filepath, const char* dstfile)
 	}
 
 
-	fseek(fp, 0, SEEK_SET);
+	fseeko(fp, 0, SEEK_SET);
 	if (1 != fread(&rom_header, sizeof(rom_header), 1, fp))
 		goto unpack_fail;
 
@@ -104,18 +138,54 @@ int unpack_rom(const char* filepath, const char* dstfile)
 		rom_header.hour, rom_header.minute, rom_header.second);
 
 	printf("chip: %x\n", rom_header.chip);
+ 
+	int64_t fsz = get_file_size(fp);
+	if (fsz < 0)
+	{
+		fprintf(stderr, "Failed to get file size\n");
+		goto unpack_fail;
+	}
+
+	uint64_t image_offset = (uint64_t)rom_header.image_offset;
+	uint64_t hdr_end = image_offset + (uint64_t)rom_header.image_length;
+	uint64_t eof_end = (fsz > 32) ? ((uint64_t)fsz - 32) : 0;
+
+	printf("image_offset: 0x%08x\n", rom_header.image_offset);
+	printf("header image_length (32-bit): 0x%08x\n", rom_header.image_length);
+	printf("file_size: %" PRIu64 "\n", (uint64_t)fsz);
 
 	printf("checking md5sum....");
 	fflush(stdout);
-	if (check_md5sum(fp, rom_header.image_offset + rom_header.image_length) != 0)
+	uint64_t md5_end = hdr_end;
+
+	if (check_md5sum(fp, hdr_end) != 0)
 	{
-		printf("Not match!\n");
-		goto unpack_fail;
+		// Common RKFW variant: ASCII MD5 is last 32 bytes of file
+		if (eof_end && check_md5sum(fp, eof_end) == 0)
+		{
+			md5_end = eof_end;
+		}
+		else
+		{
+			printf("Not match!\n");
+			goto unpack_fail;
+		}
 	}
 	printf("OK\n");
+ 
+	if (md5_end <= image_offset)
+	{
+		fprintf(stderr, "Invalid computed image span (md5_end=%" PRIu64 ", image_offset=%" PRIu64 ")\n",
+			md5_end, image_offset);
+		goto unpack_fail;
+	}
+
+	uint64_t real_image_len = md5_end - image_offset;
+	printf("exporting image: offset=%" PRIu64 " len=%" PRIu64 "\n", image_offset, real_image_len);
 
 	//export_data(loader_filename, rom_header.loader_offset, rom_header.loader_length, fp);
-	export_data(dstfile, rom_header.image_offset, rom_header.image_length, fp);
+	if (export_data(dstfile, image_offset, real_image_len, fp) != 0)
+		goto unpack_fail;
 
 	fclose(fp);
 	return 0;

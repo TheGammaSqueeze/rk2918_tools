@@ -6,6 +6,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -15,20 +17,35 @@
 
 #define UPDATE_MAGIC	"RKAF"
 
-int filestream_crc(FILE *fs, size_t stream_len)
+static int64_t get_file_size(FILE *fp)
 {
-	char buffer[1024];
-	unsigned int crc = 0;
+	off_t cur = ftello(fp);
+	if (cur < 0)
+		return -1;
+	if (fseeko(fp, 0, SEEK_END) != 0)
+		return -1;
+	off_t end = ftello(fp);
+	if (end < 0)
+		return -1;
+	if (fseeko(fp, cur, SEEK_SET) != 0)
+		return -1;
+	return (int64_t)end;
+}
 
-	while (stream_len)
+static uint32_t filestream_crc(FILE *fs, uint64_t stream_len)
+{
+	unsigned char buffer[1024];
+	uint32_t crc = 0;
+
+	while (stream_len > 0)
 	{
-		int read_len = stream_len < sizeof(buffer) ? stream_len : sizeof(buffer);
-		read_len = fread(buffer, 1, read_len, fs);
-		if (!read_len)
+		size_t want = stream_len < (uint64_t)sizeof(buffer) ? (size_t)stream_len : sizeof(buffer);
+		size_t got = fread(buffer, 1, want, fs);
+		if (got == 0)
 			break;
 
-		RKCRC(crc, buffer, read_len);
-		stream_len -= read_len;
+		RKCRC(crc, buffer, got);
+		stream_len -= (uint64_t)got;
 	}
 
 	return crc;
@@ -53,43 +70,66 @@ int create_dir(char *dir) {
 	return 0;
 }
 
-int extract_file(FILE *fp, off_t ofst, size_t len, const char *path) {
+static int extract_file(FILE *fp, uint64_t ofst, uint64_t len, const char *path)
+{
 	FILE *ofp;
-	char buffer[1024];
+	unsigned char buffer[1024];
 
 	if ((ofp = fopen(path, "wb")) == NULL) {
-		printf("Can't open/create file: %s\n", path);
+		printf("Can\'t open/create file: %s\n", path);
 		return -1;
 	}
 
-	fseeko(fp, ofst, SEEK_SET);
-	while (len)
+	if (fseeko(fp, (off_t)ofst, SEEK_SET) != 0) {
+		printf("Can\'t seek input file to offset=%" PRIu64 " (%s)\n", ofst, strerror(errno));
+		fclose(ofp);
+		return -1;
+	}
+
+	while (len > 0)
 	{
-		size_t read_len = len < sizeof(buffer) ? len : sizeof(buffer);
-		read_len = fread(buffer, 1, read_len, fp);
-		if (!read_len)
-			break;
-		fwrite(buffer, read_len, 1, ofp);
-		len -= read_len;
+		size_t want = len < (uint64_t)sizeof(buffer) ? (size_t)len : sizeof(buffer);
+		size_t got = fread(buffer, 1, want, fp);
+		if (got == 0) {
+			printf("Unexpected EOF while extracting %s\n", path);
+			fclose(ofp);
+			return -1;
+		}
+		if (fwrite(buffer, 1, got, ofp) != got) {
+			printf("Write failed for %s: %s\n", path, strerror(errno));
+			fclose(ofp);
+			return -1;
+		}
+		len -= (uint64_t)got;
 	}
 	fclose(ofp);
 
 	return 0;
 }
 
-int unpack_update(const char* srcfile, const char* dstdir) {
+int unpack_update(const char* srcfile, const char* dstdir)
+{
 	FILE *fp = NULL;
 	struct update_header header;
-	unsigned int crc = 0;
+	uint64_t data_end = 0;
+	uint32_t file_crc_le = 0;
+	uint32_t file_crc_be = 0;
+	uint32_t calc_crc = 0;
+	uint64_t payload_len = 0;
+	uint64_t crc_offset = 0;
+	int crc_ok = 0;
+	int64_t fsz = 0;
 
 	fp = fopen(srcfile, "rb");
 	if (!fp) {
-		fprintf(stderr, "can't open file \"%s\": %s\n", srcfile,
-				strerror(errno));
+		fprintf(stderr, "can't open file \"%s\": %s\n", srcfile, strerror(errno));
 		goto unpack_fail;
 	}
 
-	fseek(fp, 0, SEEK_SET);
+	if (fseeko(fp, 0, SEEK_SET) != 0) {
+		fprintf(stderr, "Can't seek image header\n");
+		goto unpack_fail;
+	}
 	if (sizeof(header) != fread(&header, 1, sizeof(header), fp)) {
 		fprintf(stderr, "Can't read image header\n");
 		goto unpack_fail;
@@ -100,42 +140,149 @@ int unpack_update(const char* srcfile, const char* dstdir) {
 		goto unpack_fail;
 	}
 
-	fseek(fp, header.length, SEEK_SET);
-	if (sizeof(crc) != fread(&crc, 1, sizeof(crc), fp))
-	{
-		fprintf(stderr, "Can't read crc checksum\n");
+	fsz = get_file_size(fp);
+	if (fsz < 0) {
+		fprintf(stderr, "Can't determine file size\n");
+		goto unpack_fail;
+	}
+	if ((uint64_t)fsz < (uint64_t)sizeof(header) + 4) {
+		fprintf(stderr, "File too small to be a valid update image\n");
 		goto unpack_fail;
 	}
 
-	
 	printf("Check file...");
 	fflush(stdout);
-	fseek(fp, 0, SEEK_SET);
-	if (crc != filestream_crc(fp, header.length)) {
-		printf("Fail\n");
-		goto unpack_fail;
+
+	// Candidate payload lengths (payload is [0, payload_len), CRC is the 4 bytes at offset payload_len)
+	//  1) optional extended length: header.reserved = "RK64" + uint64_t(payload_len)
+	//  2) legacy: header.length (uint32)
+	//  3) common in the wild: CRC is last 4 bytes of file (payload_len = file_size - 4)
+	{
+		uint64_t cand[3];
+		int cand_n = 0;
+		int i;
+
+		if (memcmp(header.reserved, "RK64", 4) == 0) {
+			uint64_t ext_len = 0;
+			memcpy(&ext_len, header.reserved + 4, sizeof(ext_len));
+			if (ext_len > 0 && ext_len + 4 <= (uint64_t)fsz) {
+				cand[cand_n++] = ext_len;
+			}
+		}
+
+		if (header.length != 0 && (uint64_t)header.length + 4 <= (uint64_t)fsz) {
+			cand[cand_n++] = (uint64_t)header.length;
+		}
+
+		cand[cand_n++] = (uint64_t)fsz - 4;
+
+		for (i = 0; i < cand_n; i++) {
+			uint8_t crc_bytes[4];
+			uint64_t pl = cand[i];
+
+			if (pl + 4 > (uint64_t)fsz)
+				continue;
+
+			if (fseeko(fp, (off_t)pl, SEEK_SET) != 0)
+				continue;
+			if (fread(crc_bytes, 1, sizeof(crc_bytes), fp) != sizeof(crc_bytes))
+				continue;
+
+			file_crc_le = (uint32_t)crc_bytes[0] |
+				((uint32_t)crc_bytes[1] << 8) |
+				((uint32_t)crc_bytes[2] << 16) |
+				((uint32_t)crc_bytes[3] << 24);
+
+			file_crc_be = ((uint32_t)crc_bytes[0] << 24) |
+				((uint32_t)crc_bytes[1] << 16) |
+				((uint32_t)crc_bytes[2] << 8) |
+				((uint32_t)crc_bytes[3] << 0);
+
+			if (fseeko(fp, 0, SEEK_SET) != 0)
+				continue;
+
+			calc_crc = filestream_crc(fp, pl);
+
+			if (calc_crc == file_crc_le || calc_crc == file_crc_be) {
+				crc_ok = 1;
+				payload_len = pl;
+				crc_offset = pl;
+				break;
+			}
+		}
 	}
-	printf("OK\n");
+
+	if (!crc_ok) {
+		printf("Fail (continuing without CRC verification)\n");
+		data_end = (uint64_t)fsz;
+	} else {
+		printf("OK\n");
+		data_end = payload_len;
+	}
 
 	printf("------- UNPACK -------\n");
+	if (crc_ok && payload_len != (uint64_t)header.length) {
+		printf("NOTE: header.length=0x%08X, using payload_len=%" PRIu64 "\n", header.length, payload_len);
+	}
+
 	if (header.num_parts) {
 		unsigned i;
 		char dir[PATH_MAX];
+		uint64_t seq_pos = sizeof(header);
+		uint64_t prev_pos = 0;
+		unsigned num = header.num_parts;
+		int header_truncated = ((uint64_t)header.length + 4 < (uint64_t)fsz);
 
-		for (i = 0; i < header.num_parts; i++) {
+		if (num > 16) {
+			fprintf(stderr, "WARNING: header.num_parts=%u (clamping to 16)\n", num);
+			num = 16;
+		}
+
+		for (i = 0; i < num; i++) {
 			struct update_part *part = &header.parts[i];
-			printf("%s\t0x%08X\t0x%08X\n", part->filename, part->pos,
-					part->size);
+			uint64_t part_pos = (uint64_t)part->pos;
+			uint64_t part_size = (uint64_t)part->size;
+			uint64_t part_padded = (uint64_t)part->padded_size;
+			uint64_t seq_part_pos = seq_pos;
+			int use_seq = 0;
 
 			if (strcmp(part->filename, "SELF") == 0) {
-				printf("Skip SELF file.\n");
+				printf("%s\t<SELF>\n", part->filename);
 				continue;
 			}
 
-			// parameter 多出文件头8个字节,文件尾4个字节
+			// Default padding used by this toolchain is 2048 bytes
+			if (part_padded == 0 || part_padded < part_size) {
+				uint64_t pad = 2048;
+				part_padded = (part_size + (pad - 1)) / pad * pad;
+			}
+			seq_pos += part_padded;
+
+			// Prefer sequential offsets when header fields wrap or look inconsistent
+			if (header_truncated)
+				use_seq = 1;
+			if (part_pos < sizeof(header))
+				use_seq = 1;
+			if (part_pos + part_size > data_end)
+				use_seq = 1;
+			if (i > 0 && part_pos < prev_pos)
+				use_seq = 1;
+
+			if (use_seq)
+				part_pos = seq_part_pos;
+
+			prev_pos = part_pos;
+
+			printf("%s\tpos=%" PRIu64 "\tsize=%" PRIu64 "\n", part->filename, part_pos, part_size);
+
+			// parameter has an extra 8-byte header and 4-byte footer
 			if (memcmp(part->name, "parameter", 9) == 0) {
-				part->pos += 8;
-				part->size -= 12;
+				if (part_size < 12) {
+					fprintf(stderr, "Invalid parameter entry (too small): %s\n", part->filename);
+					continue;
+				}
+				part_pos += 8;
+				part_size -= 12;
 			}
 
 			snprintf(dir, sizeof(dir), "%s/%s", dstdir, part->filename);
@@ -143,23 +290,21 @@ int unpack_update(const char* srcfile, const char* dstdir) {
 			if (-1 == create_dir(dir))
 				continue;
 
-			if (part->pos + part->size > header.length) {
-				fprintf(stderr, "Invalid part: %s\n", part->name);
+			if (part_pos + part_size > data_end) {
+				fprintf(stderr, "Invalid part span: %s\n", part->name);
 				continue;
 			}
 
-			extract_file(fp, part->pos, part->size, dir);
+			extract_file(fp, part_pos, part_size, dir);
 		}
 	}
 
 	fclose(fp);
-
 	return 0;
 
 unpack_fail:
-	if (fp) {
+	if (fp)
 		fclose(fp);
-	}
 
 	return -1;
 }
@@ -467,7 +612,12 @@ int import_package(FILE *ofp, struct update_part *pack, const char *path)
 	char buf[2048];
 	size_t readlen;
 
-	pack->pos = ftell(ofp);
+	{
+		off_t pos = ftello(ofp);
+		if (pos < 0)
+			return -1;
+		pack->pos = (unsigned int)pos;
+	}
 	ifp = fopen(path, "rb");
 	if (!ifp)
 		return -1;
@@ -511,22 +661,26 @@ int import_package(FILE *ofp, struct update_part *pack, const char *path)
 
 void append_crc(FILE *fp)
 {
-	unsigned int crc = 0;
-	off_t file_len = 0;
+	uint32_t crc = 0;
+	int64_t file_len = 0;
 
-	fseeko(fp, 0, SEEK_END);
-	file_len = ftello(fp);
-
-	if (file_len == (off_t) -1)
+	if (fseeko(fp, 0, SEEK_END) != 0)
 		return;
 
-	fseek(fp, 0, SEEK_SET);
+	file_len = ftello(fp);
+	if (file_len < 0)
+		return;
+
+	if (fseeko(fp, 0, SEEK_SET) != 0)
+		return;
 
 	printf("Add CRC...\n");
 
-	crc = filestream_crc(fp, file_len);
+	crc = filestream_crc(fp, (uint64_t)file_len);
 
-	fseek(fp, 0, SEEK_END);
+	if (fseeko(fp, 0, SEEK_END) != 0)
+		return;
+
 	fwrite(&crc, 1, sizeof(crc), fp);
 }
 
@@ -574,7 +728,22 @@ int pack_update(const char* srcdir, const char* dstfile) {
 	strcpy(header.manufacturer, package_image.manufacturer);
 	strcpy(header.model, package_image.machine_model);
 	strcpy(header.id, package_image.machine_id);
-	header.length = ftell(fp);
+	{
+		off_t pos = ftello(fp);
+		uint64_t payload_len = 0;
+		if (pos < 0) {
+			printf("ftello() failed: %s\n", strerror(errno));
+			goto pack_failed;
+		}
+		payload_len = (uint64_t)pos;
+		header.length = (unsigned int)payload_len;
+
+		if (payload_len > (uint64_t)UINT32_MAX) {
+			// Store the real length in the reserved area (backwards compatible)
+			memcpy(header.reserved, "RK64", 4);
+			memcpy(header.reserved + 4, &payload_len, sizeof(payload_len));
+		}
+	}
 	header.num_parts = package_image.num_package;
 	header.version = package_image.version;
 
@@ -587,7 +756,7 @@ int pack_update(const char* srcdir, const char* dstfile) {
 		}
 	}
 
-	fseek(fp, 0, SEEK_SET);
+	fseeko(fp, 0, SEEK_SET);
 	fwrite(&header, sizeof(header), 1, fp);
 
 	append_crc(fp);

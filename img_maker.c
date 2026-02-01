@@ -3,16 +3,19 @@
 #include <string.h>
 #include <limits.h>
 #include <time.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <sys/types.h>
 #include "rkrom_29xx.h"
 #include "rkafp.h"
 #include "md5.h"
 
-unsigned int chiptype = 0x50;
+uint32_t chiptype = 0x50;
 
-unsigned int import_data(const char* infile, void *head, size_t head_len, FILE *fp)
+static uint64_t import_data(const char* infile, void *head, size_t head_len, FILE *fp)
 {
 	FILE *in_fp = NULL;
-	unsigned readlen = 0;
+	uint64_t readlen = 0;
 	unsigned char buffer[1024];
 	
 	in_fp = fopen(infile, "rb");
@@ -28,7 +31,7 @@ unsigned int import_data(const char* infile, void *head, size_t head_len, FILE *
 
 	while (1)
 	{
-		int len = fread(buffer, 1, sizeof(buffer), in_fp);
+		size_t len = fread(buffer, 1, sizeof(buffer), in_fp);
 
 		if (len)
 		{
@@ -54,7 +57,7 @@ void append_md5sum(FILE *fp)
 	int i;
 	
 	MD5_Init(&md5_ctx);
-	fseek(fp, 0, SEEK_SET);
+	fseeko(fp, 0, SEEK_SET);
 	
 	while (1)
 	{
@@ -69,7 +72,10 @@ void append_md5sum(FILE *fp)
 	}
 	
 	MD5_Final(buffer, &md5_ctx);
-	
+
+	// Switch from read to write on the same stream
+	fseeko(fp, 0, SEEK_END);
+
 	for (i = 0; i < 16; ++i)
 	{
 		fprintf(fp, "%02x", buffer[i]);
@@ -128,7 +134,12 @@ int pack_rom(const char *loader_filename, const char *image_filename, const char
 */
 	fseek(fp, rom_header.loader_offset, SEEK_SET);
 	fprintf(stderr, "generate image...\n");
-	rom_header.loader_length = import_data(loader_filename, &loader_header, sizeof(loader_header), fp);
+	{
+		uint64_t loader_len = import_data(loader_filename, &loader_header, sizeof(loader_header), fp);
+		if (loader_len > (uint64_t)UINT32_MAX)
+			fprintf(stderr, "WARNING: loader_length truncated (len=%" PRIu64 ")\n", loader_len);
+		rom_header.loader_length = (uint32_t)loader_len;
+	}
 	
 	if (rom_header.loader_length <  sizeof(loader_header))
 	{
@@ -137,7 +148,12 @@ int pack_rom(const char *loader_filename, const char *image_filename, const char
 	}
 	
 	rom_header.image_offset = rom_header.loader_offset + rom_header.loader_length;
-	rom_header.image_length = import_data(image_filename, &rkaf_header, sizeof(rkaf_header), fp);
+	{
+		uint64_t img_len = import_data(image_filename, &rkaf_header, sizeof(rkaf_header), fp);
+		if (img_len > (uint64_t)UINT32_MAX)
+			fprintf(stderr, "WARNING: image_length truncated (len=%" PRIu64 ")\n", img_len);
+		rom_header.image_length = (uint32_t)img_len;
+	}
 	if (rom_header.image_length < sizeof(rkaf_header))
 	{
 		fprintf(stderr, "invalid rom :\"\%s\"\n",  image_filename);
@@ -160,7 +176,7 @@ int pack_rom(const char *loader_filename, const char *image_filename, const char
 	else
 		rom_header.backup_endpos = 0;
 	
-	fseek(fp, 0, SEEK_SET);
+	fseeko(fp, 0, SEEK_SET);
 	if (1 != fwrite(&rom_header, sizeof(rom_header), 1, fp))
 		goto pack_fail;
 

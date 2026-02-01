@@ -2,11 +2,13 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <sys/types.h>
 
 #include "rkcrc.h"
 
 #define MAGIC_CODE "KRNL"
-
 
 struct krnl_header
 {
@@ -16,72 +18,80 @@ struct krnl_header
 
 int pack_krnl(FILE *fp_in, FILE *fp_out)
 {
-	char buf[1024];
+	unsigned char buf[1024];
 	struct krnl_header header =
 	{
 		"KRNL",
 		0
 	};
 
-	unsigned int crc = 0;
+	uint32_t crc = 0;
+	uint64_t length64 = 0;
 
 	fwrite(&header, sizeof(header), 1, fp_out);
 
 	while (1)
 	{
-		int readlen = fread(buf, 1, sizeof(buf), fp_in);
+		size_t readlen = fread(buf, 1, sizeof(buf), fp_in);
 		if (readlen == 0)
 			break;
 
-		header.length += readlen;
+		length64 += (uint64_t)readlen;
 		fwrite(buf, 1, readlen, fp_out);
 		RKCRC(crc, buf, readlen);
 	}
 
 	fwrite(&crc, sizeof(crc), 1, fp_out);
-	fseek(fp_out, 0, SEEK_SET);
+
+	if (length64 > (uint64_t)UINT32_MAX)
+		fprintf(stderr, "WARNING: kernel length truncated (len=%" PRIu64 ")\n", length64);
+
+	header.length = (unsigned int)length64;
+
+	fseeko(fp_out, 0, SEEK_SET);
 	fwrite(&header, sizeof(header), 1, fp_out);
 
-	printf("%04X\n", crc);
+	printf("%08" PRIX32 "\n", crc);
 
 	return 0;
-//fail:
-	fprintf(stderr, "FAIL\n");
-	return -1;
 }
 
 int unpack_krnl(FILE *fp_in, FILE *fp_out)
 {
-	char buf[1024];
+	unsigned char buf[1024];
 	struct krnl_header header;
-	size_t length = 0;
-	unsigned int crc = 0;
-	unsigned int file_crc = 0;
+	uint64_t length = 0;
+	uint32_t crc = 0;
+	uint32_t file_crc = 0;
 
 	fprintf(stderr, "unpacking...");
 	fflush(stderr);
-	if (sizeof(header) != fread(&header, 1, sizeof(header), fp_in))
-	{
-		goto fail;
-	}
 
-	fseek(fp_in, header.length + sizeof(header), SEEK_SET);
+	if (sizeof(header) != fread(&header, 1, sizeof(header), fp_in))
+		goto fail;
+
+	// CRC is stored after the payload
+	if (fseeko(fp_in, (off_t)header.length + (off_t)sizeof(header), SEEK_SET) != 0)
+		goto fail;
+
 	if (sizeof(file_crc) != fread(&file_crc, 1, sizeof(file_crc), fp_in))
 		goto fail;
 
-	length = header.length;
-	fseek(fp_in, sizeof(header), SEEK_SET);
+	length = (uint64_t)header.length;
+
+	if (fseeko(fp_in, (off_t)sizeof(header), SEEK_SET) != 0)
+		goto fail;
 
 	while (length > 0)
 	{
-		int readlen = length < sizeof(buf) ? length : sizeof(buf);
-		readlen = fread(buf, 1, readlen, fp_in);
-		length -= readlen;
-		fwrite(buf, 1, readlen, fp_out);
-		RKCRC(crc, buf, readlen);
-
+		size_t want = length < (uint64_t)sizeof(buf) ? (size_t)length : sizeof(buf);
+		size_t readlen = fread(buf, 1, want, fp_in);
 		if (readlen == 0)
 			break;
+
+		length -= (uint64_t)readlen;
+		fwrite(buf, 1, readlen, fp_out);
+		RKCRC(crc, buf, readlen);
 	}
 
 	if (file_crc != crc)
@@ -114,6 +124,7 @@ int main(int argc, char **argv)
 		action = 2;
 	} else {
 		fprintf(stderr, "usage: %s [-a|-r] <input> <output>\n", argv[0]);
+		return 1;
 	}
 
 	fp_in = fopen(argv[2], "rb");
@@ -127,6 +138,7 @@ int main(int argc, char **argv)
 	if (!fp_out)
 	{
 		fprintf(stderr, "can't open output file '%s': %s\n", argv[3], strerror(errno));
+		fclose(fp_in);
 		return 1;
 	}
 
@@ -141,6 +153,9 @@ int main(int argc, char **argv)
 	default:
 		break;
 	}
+
+	fclose(fp_in);
+	fclose(fp_out);
 
 	return 0;
 }
