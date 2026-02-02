@@ -16,6 +16,33 @@
 #include "rkafp.h"
 
 #define UPDATE_MAGIC	"RKAF"
+// Android sparse image support (needed to correctly extract sparse images when
+// header.size/padded_size are vendor-truncated due to 32-bit overflow).
+#define SPARSE_MAGIC 0xED26FF3A
+#define SPARSE_CHUNK_TYPE_RAW       0xCAC1
+#define SPARSE_CHUNK_TYPE_FILL      0xCAC2
+#define SPARSE_CHUNK_TYPE_DONT_CARE 0xCAC3
+#define SPARSE_CHUNK_TYPE_CRC32     0xCAC4
+
+struct sparse_header {
+	uint32_t magic;
+	uint16_t major_version;
+	uint16_t minor_version;
+	uint16_t file_hdr_sz;
+	uint16_t chunk_hdr_sz;
+	uint32_t blk_sz;
+	uint32_t total_blks;
+	uint32_t total_chunks;
+	uint32_t image_checksum;
+} __attribute__((packed));
+
+struct sparse_chunk_header {
+	uint16_t chunk_type;
+	uint16_t reserved1;
+	uint32_t chunk_sz;   // in output blocks
+	uint32_t total_sz;   // in bytes, including chunk header
+} __attribute__((packed));
+
 
 static int64_t get_file_size(FILE *fp)
 {
@@ -49,6 +76,101 @@ static uint32_t filestream_crc(FILE *fs, uint64_t stream_len)
 	}
 
 	return crc;
+}
+
+static uint64_t align_up_u64(uint64_t v, uint64_t a)
+{
+	return (a == 0) ? v : ((v + a - 1) / a) * a;
+}
+
+// Compute the actual input byte length of an Android sparse image, starting at
+// file offset 'pos'. This is required because some vendor RKAF packages store
+// a truncated 32-bit 'size' field for large sparse images (notably super.img).
+static int compute_sparse_input_len(FILE *fp, uint64_t pos, uint64_t max_avail, uint64_t *out_len)
+{
+	struct sparse_header sh;
+	uint64_t total = 0;
+	uint32_t i;
+
+	if (max_avail < sizeof(sh))
+		return -1;
+
+	if (fseeko(fp, (off_t)pos, SEEK_SET) != 0)
+		return -1;
+	if (fread(&sh, 1, sizeof(sh), fp) != sizeof(sh))
+		return -1;
+	if (sh.magic != SPARSE_MAGIC)
+		return -1;
+	if (sh.file_hdr_sz < sizeof(sh))
+		return -1;
+	if (sh.chunk_hdr_sz < sizeof(struct sparse_chunk_header))
+		return -1;
+
+	// Skip to end of sparse file header (can be larger than struct sparse_header)
+	total = sh.file_hdr_sz;
+	if (total > max_avail)
+		return -1;
+	if (fseeko(fp, (off_t)(pos + sh.file_hdr_sz), SEEK_SET) != 0)
+		return -1;
+
+	for (i = 0; i < sh.total_chunks; i++) {
+		struct sparse_chunk_header ch;
+		uint64_t data = 0;
+		uint64_t declared = 0;
+		uint64_t need = 0;
+
+		if (total + sh.chunk_hdr_sz > max_avail)
+			return -1;
+
+		// Read standard chunk header first
+		if (fread(&ch, 1, sizeof(ch), fp) != sizeof(ch))
+			return -1;
+		// Skip extended chunk header bytes if any
+		if (sh.chunk_hdr_sz > sizeof(ch)) {
+			uint64_t extra = (uint64_t)sh.chunk_hdr_sz - (uint64_t)sizeof(ch);
+			if (total + sizeof(ch) + extra > max_avail)
+				return -1;
+			if (fseeko(fp, (off_t)extra, SEEK_CUR) != 0)
+				return -1;
+		}
+
+		total += sh.chunk_hdr_sz;
+
+		switch (ch.chunk_type) {
+		case SPARSE_CHUNK_TYPE_RAW:
+			data = (uint64_t)ch.chunk_sz * (uint64_t)sh.blk_sz;
+			break;
+		case SPARSE_CHUNK_TYPE_FILL:
+			data = 4;
+			break;
+		case SPARSE_CHUNK_TYPE_DONT_CARE:
+			data = 0;
+			break;
+		case SPARSE_CHUNK_TYPE_CRC32:
+			data = 4;
+			break;
+		default:
+			return -1;
+		}
+
+		need = data;
+		if (ch.total_sz >= sh.chunk_hdr_sz) {
+			declared = (uint64_t)ch.total_sz - (uint64_t)sh.chunk_hdr_sz;
+			if (declared <= data)
+				need = declared;
+		}
+
+		if (total + need > max_avail)
+			return -1;
+		if (need) {
+			if (fseeko(fp, (off_t)need, SEEK_CUR) != 0)
+				return -1;
+			total += need;
+		}
+	}
+
+	*out_len = total;
+	return 0;
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -227,34 +349,43 @@ int unpack_update(const char* srcfile, const char* dstdir)
 
 	if (header.num_parts) {
 		unsigned i;
-		char dir[PATH_MAX];
+		char out_path[PATH_MAX];
 		uint64_t seq_pos = sizeof(header);
 		uint64_t prev_pos = 0;
 		unsigned num = header.num_parts;
 		int header_truncated = ((uint64_t)header.length + 4 < (uint64_t)fsz);
+		uint64_t max_end = seq_pos;
 
 		if (num > 16) {
 			fprintf(stderr, "WARNING: header.num_parts=%u (clamping to 16)\n", num);
 			num = 16;
 		}
 
+		// Ensure conventional output layout exists (package-file at root, payload under Image/)
+		snprintf(out_path, sizeof(out_path), "%s/Image/._", dstdir);
+		create_dir(out_path);
+
 		for (i = 0; i < num; i++) {
 			struct update_part *part = &header.parts[i];
 			uint64_t part_pos = (uint64_t)part->pos;
-			uint64_t part_size = (uint64_t)part->size;
+			uint64_t part_size_raw = (uint64_t)part->size;
+			uint64_t part_size = part_size_raw;
 			uint64_t part_padded = (uint64_t)part->padded_size;
 			uint64_t seq_part_pos = seq_pos;
 			int use_seq = 0;
+			int is_parameter = 0;
+			int is_sparse = 0;
+			uint64_t padded_effective = 0;
 
 			if (strcmp(part->filename, "SELF") == 0) {
-				printf("%s\t<SELF>\n", part->filename);
+				printf("%s	<SELF>\n", part->filename);
 				continue;
 			}
 
 			// Default padding used by this toolchain is 2048 bytes
-			if (part_padded == 0 || part_padded < part_size) {
+			if (part_padded == 0 || part_padded < part_size_raw) {
 				uint64_t pad = 2048;
-				part_padded = (part_size + (pad - 1)) / pad * pad;
+				part_padded = (part_size_raw + (pad - 1)) / pad * pad;
 			}
 			seq_pos += part_padded;
 
@@ -263,7 +394,7 @@ int unpack_update(const char* srcfile, const char* dstdir)
 				use_seq = 1;
 			if (part_pos < sizeof(header))
 				use_seq = 1;
-			if (part_pos + part_size > data_end)
+			if (part_pos + part_size_raw > data_end)
 				use_seq = 1;
 			if (i > 0 && part_pos < prev_pos)
 				use_seq = 1;
@@ -273,21 +404,49 @@ int unpack_update(const char* srcfile, const char* dstdir)
 
 			prev_pos = part_pos;
 
-			printf("%s\tpos=%" PRIu64 "\tsize=%" PRIu64 "\n", part->filename, part_pos, part_size);
-
-			// parameter has an extra 8-byte header and 4-byte footer
+			// parameter has an extra 8-byte header and 4-byte footer (strip for the exported parameter.txt)
 			if (memcmp(part->name, "parameter", 9) == 0) {
-				if (part_size < 12) {
+				is_parameter = 1;
+				if (part_size_raw < 12) {
 					fprintf(stderr, "Invalid parameter entry (too small): %s\n", part->filename);
 					continue;
 				}
 				part_pos += 8;
-				part_size -= 12;
+				part_size = part_size_raw - 12;
 			}
 
-			snprintf(dir, sizeof(dir), "%s/%s", dstdir, part->filename);
+			// Detect Android sparse images and compute their true input length.
+			// Some RKAF packages exceed 4GiB and the 32-bit header.size wraps.
+			if (!is_parameter) {
+				uint64_t max_avail = (data_end > part_pos) ? (data_end - part_pos) : 0;
+				uint64_t sparse_len = 0;
 
-			if (-1 == create_dir(dir))
+				if (max_avail >= sizeof(struct sparse_header) &&
+					compute_sparse_input_len(fp, part_pos, max_avail, &sparse_len) == 0) {
+					is_sparse = 1;
+					part_size = sparse_len;
+					padded_effective = align_up_u64(part_size, 2048);
+
+					// We already advanced seq_pos by the (possibly truncated) padded size.
+					// If the true padded size is larger, adjust seq_pos so subsequent parts stay aligned.
+					if (padded_effective > part_padded) {
+						uint64_t delta = padded_effective - part_padded;
+						seq_pos += delta;
+						part_padded = padded_effective;
+					}
+				}
+			}
+
+			// Choose output path: package-file and RESERVED at root; everything else under Image/
+			if (strcmp(part->filename, "package-file") == 0 || strcmp(part->filename, "RESERVED") == 0) {
+				snprintf(out_path, sizeof(out_path), "%s/%s", dstdir, part->filename);
+			} else if (strncmp(part->filename, "Image/", 6) == 0) {
+				snprintf(out_path, sizeof(out_path), "%s/%s", dstdir, part->filename);
+			} else {
+				snprintf(out_path, sizeof(out_path), "%s/Image/%s", dstdir, part->filename);
+			}
+
+			if (-1 == create_dir(out_path))
 				continue;
 
 			if (part_pos + part_size > data_end) {
@@ -295,7 +454,41 @@ int unpack_update(const char* srcfile, const char* dstdir)
 				continue;
 			}
 
-			extract_file(fp, part_pos, part_size, dir);
+			if (is_parameter)
+				printf("%s	pos=%" PRIu64 "	raw=%" PRIu64 "	exported=%" PRIu64 "	-> %s\n",
+					part->filename, part_pos, part_size_raw, part_size, out_path);
+			else if (is_sparse)
+				printf("%s	pos=%" PRIu64 "	raw=%" PRIu64 "	sparse=%" PRIu64 "	-> %s\n",
+					part->filename, part_pos, part_size_raw, part_size, out_path);
+			else
+				printf("%s	pos=%" PRIu64 "	size=%" PRIu64 "	-> %s\n",
+					part->filename, part_pos, part_size, out_path);
+
+			extract_file(fp, part_pos, part_size, out_path);
+
+			// Track max end using padded end (for RESERVED filler sizing)
+			if (seq_part_pos + part_padded > max_end)
+				max_end = seq_part_pos + part_padded;
+		}
+
+		// If the payload is larger than the last extracted padded block, create RESERVED filler.
+		// This enables repacking to preserve the original padding (often used to reach fixed SD image sizes).
+		if (crc_ok && payload_len > max_end) {
+			uint64_t fill = payload_len - max_end;
+			FILE *rfp;
+			snprintf(out_path, sizeof(out_path), "%s/RESERVED", dstdir);
+			rfp = fopen(out_path, "wb");
+			if (rfp) {
+				if (fill > 0) {
+					// Make it sparse: seek to last byte and write 0
+					if (fseeko(rfp, (off_t)(fill - 1), SEEK_SET) == 0)
+						fputc(0, rfp);
+				}
+				fclose(rfp);
+				printf("RESERVED	(size=%" PRIu64 ")	-> %s\n", fill, out_path);
+			} else {
+				fprintf(stderr, "WARNING: failed to create RESERVED (%s)\n", strerror(errno));
+			}
 		}
 	}
 
@@ -533,6 +726,8 @@ struct pack_part* find_package_byname(const char *name)
 void append_package(const char *name, const char *path)
 {
 	struct partition *p_part;
+	if (package_image.num_package >= 16)
+		return;
 	struct pack_part *p_pack = &package_image.packages[package_image.num_package];
 
 	strncpy(p_pack->name, name, sizeof(p_pack->name));
@@ -591,6 +786,11 @@ int get_packages(const char *fname)
 		}
 
 		path = startp;
+
+		// Some vendor package-files include entries like "backup RESERVED".
+		// RESERVED is a placeholder and is not stored as a blob in the RKAF payload.
+		if (strcmp(path, "RESERVED") == 0)
+			continue;
 
 		append_package(name, path);
 	}
@@ -693,13 +893,34 @@ int pack_update(const char* srcdir, const char* dstfile) {
 	printf("------ PACKAGE ------\n");
 	memset(&header, 0, sizeof(header));
 
-	snprintf(buf, sizeof(buf), "%s/%s", srcdir, "parameter");
-	if (parse_parameter(buf))
-		return -1;
+	/* parameter file may be located at several common paths depending on the unpack layout */
+	{
+		const char *cands[] = {"parameter", "parameter.txt", "Image/parameter.txt"};
+		int ok = 0;
+		for (size_t ci = 0; ci < sizeof(cands)/sizeof(cands[0]); ++ci) {
+			snprintf(buf, sizeof(buf), "%s/%s", srcdir, cands[ci]);
+			if (access(buf, R_OK) == 0) {
+				ok = 1;
+				break;
+			}
+		}
+		if (!ok) {
+			printf("Can't open parameter file under %s (tried parameter, parameter.txt, Image/parameter.txt)\n", srcdir);
+			return -1;
+		}
+		if (parse_parameter(buf))
+			return -1;
+	}
 
 	snprintf(buf, sizeof(buf), "%s/%s", srcdir, "package-file");
 	if (get_packages(buf))
 		return -1;
+
+	if (package_image.num_package > 16) {
+		printf("WARNING: package-file lists %u entries, clamping to 16\n", package_image.num_package);
+		package_image.num_package = 16;
+	}
+
 
 	fp = fopen(dstfile, "wb+");
 	if (!fp)
@@ -720,8 +941,29 @@ int pack_update(const char* srcdir, const char* dstfile) {
 			continue;
 
 		snprintf(buf, sizeof(buf), "%s/%s", srcdir, header.parts[i].filename);
+		if (access(buf, R_OK) != 0) {
+			char alt[PATH_MAX];
+			// If the filename is Image/..., also try without the Image/ prefix (flat layouts)
+			if (strncmp(header.parts[i].filename, "Image/", 6) == 0) {
+				snprintf(alt, sizeof(alt), "%s/%s", srcdir, header.parts[i].filename + 6);
+			} else {
+				// Otherwise, try under Image/ (conventional layout)
+				snprintf(alt, sizeof(alt), "%s/Image/%s", srcdir, header.parts[i].filename);
+			}
+			if (access(alt, R_OK) == 0)
+				strncpy(buf, alt, sizeof(buf));
+		}
+
+		if (access(buf, R_OK) != 0) {
+			printf("Missing input file for %s: %s\n", header.parts[i].name, buf);
+			goto pack_failed;
+		}
+
 		printf("Add file: %s\n", buf);
-		import_package(fp, &header.parts[i], buf);
+		if (import_package(fp, &header.parts[i], buf) != 0) {
+			printf("Failed to import: %s\n", buf);
+			goto pack_failed;
+		}
 	}
 
 	memcpy(header.magic, "RKAF", sizeof(header.magic));
